@@ -21,6 +21,7 @@ import asyncio
 import logging
 import os
 
+import torch
 import torch.distributed as dist
 from omegaconf import DictConfig
 from sglang.srt.entrypoints.engine import Engine
@@ -47,6 +48,20 @@ from .base import BaseShardingManager
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_PPO_LOGGING_LEVEL", "WARN"))
+
+# Import SGLang FP8 quantization
+try:
+    from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
+    FP8_AVAILABLE = True
+    logger.info("SGLang FP8 quantization available")
+except ImportError:
+    try:
+        from vllm._custom_ops import scaled_fp8_quant
+        FP8_AVAILABLE = True
+        logger.info("vLLM FP8 quantization available")
+    except ImportError:
+        FP8_AVAILABLE = False
+        logger.warning("FP8 quantization not available. Using original weight update method.")
 
 
 """
@@ -94,6 +109,7 @@ class MegatronSGLangShardingManager(BaseShardingManager):
         device_mesh: DeviceMesh | None = None,
         offload_param: bool = False,
         bridge=None,
+        enable_fp8_quantization: bool = False,
     ):
         self.actor_module = actor_module
         self.inference_engine = inference_engine
@@ -105,6 +121,7 @@ class MegatronSGLangShardingManager(BaseShardingManager):
         self.device_mesh = device_mesh
         self.bridge = bridge
         self.offload_param = offload_param
+        self.enable_fp8_quantization = enable_fp8_quantization and FP8_AVAILABLE
 
         if self.device_mesh is not None:
             self.infer_tp_size = self.device_mesh["tp"].mesh.size()[0]
@@ -121,6 +138,10 @@ class MegatronSGLangShardingManager(BaseShardingManager):
             get_torch_device().set_rng_state(self.torch_random_states)
         else:
             self.gen_random_states = None
+
+        if self.enable_fp8_quantization:
+            logger.info("FP8 quantization enabled for weight updates")
+
 
     @GPUMemoryLogger(role="MegatronSGLangShardingManager enter", logger=logger)
     def __enter__(self):
@@ -186,6 +207,43 @@ class MegatronSGLangShardingManager(BaseShardingManager):
                 # Example: from [[(n0, t0_tp0), (n1, t1_tp0)], [(n0, t0_tp1), (n1, t1_tp1)]]
                 # to [ ( (n0, t0_tp0), (n0, t0_tp1) ), ( (n1, t1_tp0), (n1, t1_tp1) ) ]
                 logical_tensors = zip(*gathered_serialized_batches, strict=False)
+            # Apply FP8 quantization to tensors if enabled
+            if self.enable_fp8_quantization:
+                logger.info("Applying FP8 quantization to tensors in the batch")
+                quantized_batch = []
+                for name, tensor in named_tensors_batch:
+                    if tensor.dtype in [torch.float16, torch.bfloat16, torch.float32]:
+                        # Store original tensor for comparison
+                        original_tensor = tensor.clone()
+                        original_shape = tensor.shape
+                        print(f'tensor.dim()={tensor.dim()}')
+                        # Reshape tensor to 2D for FP8 quantization (required by scaled_fp8_quant)
+                        if tensor.dim() > 2:
+                            # Flatten all dimensions except the last one for quantization
+                            # For example: (batch, seq, hidden) -> (batch*seq, hidden)
+                            tensor_2d = tensor.view(-1, tensor.shape[-1])
+                        else:
+                            tensor_2d = tensor
+                        
+                        # Apply FP8 quantization using SGLang's online quantization
+                        quantized_tensor, scale = scaled_fp8_quant(tensor_2d)
+                        
+                        # Reshape back to original shape
+                        quantized_tensor = quantized_tensor.view(original_shape)
+                        
+                        logger.info(f"Applied FP8 quantization to tensor {name}")
+                        logger.info(f"  Scale: {scale.item():.6f}")
+                        # logger.debug(f"  Max error: {max_error:.6f}")
+                        # logger.debug(f"  Mean error: {mean_error:.6f}")
+                        logger.info(f"  Original shape: {original_shape}")
+                        logger.info(f"  Quantized dtype: {quantized_tensor.dtype}")
+                        
+                        quantized_batch.append((name, quantized_tensor))
+                    else:
+                        # Keep original tensor if not supported for quantization
+                        quantized_batch.append((name, tensor))
+                batch = quantized_batch
+                
                 await self.inference_engine.update_weights_from_tensor(
                     named_tensors=[
                         # 'tensor_group' represents a single logical tensor's data from all ranks.

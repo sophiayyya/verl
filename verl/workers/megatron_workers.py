@@ -374,6 +374,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                 bridge=self.bridge,
                 device_mesh=rollout_device_mesh,
                 offload_param=self._is_offload_param,
+                enable_fp8_quantization=self.config.rollout.get("enable_fp8_quantization", True),
             )
             log_gpu_memory_usage("After building sharding manager", logger=logger)
         else:
