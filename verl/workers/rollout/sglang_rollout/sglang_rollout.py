@@ -437,9 +437,11 @@ class SGLangRollout(BaseRollout):
         if first_rank_in_node:
             rank = dist.get_rank()
             os.environ["SGLANG_BLOCK_NONZERO_RANK_CHILDREN"] = "0"
+            logger.info("init sglangening with fp8 quantization")
             self._engine = AsyncEngine(
                 model_path=actor_module,
                 dtype=self.config.dtype,
+                quantization="fp8",
                 mem_fraction_static=self.config.gpu_memory_utilization,
                 enable_memory_saver=True,
                 base_gpu_id=0,
