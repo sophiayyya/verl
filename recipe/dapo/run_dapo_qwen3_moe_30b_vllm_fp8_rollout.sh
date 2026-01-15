@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -xeuo pipefail
 
-project_name='DAPO-FP8-ROLLOUT'
+project_name='DAPO-FP8-qwen3-30b'
 exp_name='DAPO-Qwen3-MOE-30B-VLLM-FP8-ROLLOUT'
 
 

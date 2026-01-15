@@ -35,7 +35,15 @@ from vllm.inputs import TokensPrompt
 from vllm.lora.request import LoRARequest
 from vllm.outputs import RequestOutput
 from vllm.usage.usage_lib import UsageContext
-from vllm.utils import FlexibleArgumentParser, get_tcp_uri
+# from vllm.utils import FlexibleArgumentParser, get_tcp_uri
+try:
+    from vllm.utils import get_tcp_uri
+except ImportError:
+    from vllm.utils.network_utils import get_tcp_uri
+try:
+    from vllm.utils import FlexibleArgumentParser
+except ImportError:
+    from vllm.utils.argparse_utils import FlexibleArgumentParser
 from vllm.v1.engine.async_llm import AsyncLLM
 from vllm.v1.engine.core import EngineCoreProc
 from vllm.v1.engine.utils import CoreEngineProcManager
@@ -358,7 +366,8 @@ class vLLMHttpServerBase:
         await engine_client.reset_mm_cache()
 
         app = build_app(args)
-        await init_app_state(engine_client, vllm_config, app.state, args)
+        await init_app_state(engine_client, app.state, args)
+        # await init_app_state(engine_client, vllm_config, app.state, args)
         if self.replica_rank == 0 and self.node_rank == 0:
             logger.info(f"Initializing a V1 LLM engine with config: {vllm_config}")
 
