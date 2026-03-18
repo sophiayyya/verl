@@ -235,6 +235,9 @@ class RolloutConfig(BaseConfig):
 
     quantization: Optional[str] = None
 
+    # FP8 quantization granularity: "per_block" (default) or "per_tensor"
+    fp8_quant_granularity: str = "per_block"
+
     quantization_config_file: Optional[str] = None
 
     enable_rollout_routing_replay: bool = False
