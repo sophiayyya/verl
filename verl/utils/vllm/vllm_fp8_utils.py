@@ -132,7 +132,7 @@ def quant_weights(weights, model, quant_config, dtype=torch.bfloat16):
             from vllm import _custom_ops as ops
             param_lp, param_scale = ops.scaled_fp8_quant(v, scale=None)
             yield (k, param_lp)
-            # per-tensor always uses "weight_scale" regardless of vLLM version
+            # per-tensor always uses "weight_scale" regardless of vllm version
             yield (k + "_scale", param_scale)
         else:
             if torch.distributed.get_rank() == 0:
@@ -143,7 +143,7 @@ def quant_weights(weights, model, quant_config, dtype=torch.bfloat16):
             )
             param_scale = param_scale.squeeze(-1)
             yield (k, param_lp)
-            # Yield the scale with appropriate naming based on vLLM version
+            # Yield the scale with appropriate naming based on vllm version
             if _use_scale_not_scale_inv and "expert" not in k:
                 yield (k + "_scale", param_scale)
             else:
@@ -309,6 +309,7 @@ def process_weights_after_loading_for_vllm14(self, layer) -> None:
     )
     from vllm.model_executor.parameter import (
         BlockQuantScaleParameter,
+        PerTensorScaleParameter,
         ModelWeightParameter,
     )
     from vllm.model_executor.utils import replace_parameter
@@ -364,24 +365,45 @@ def process_weights_after_loading_for_vllm14(self, layer) -> None:
         )
         weight = weight.t()
 
+        # Wrap the original weight_loader so that refit (repeated load_weights
+        # calls) works correctly.  After process_weights_after_loading, the
+        # weight is stored transposed as [in, out] for torch._scaled_mm.
+        # When load_qkv_weight (or any other loader) runs during refit it
+        # narrows on output_dim=0, which now points to the input dimension and
+        # produces a shape mismatch.  The wrapper temporarily flips the view
+        # back to [out, in] via a zero-copy .t() stride swap, lets the original
+        # loader run against the correct layout, then flips back.
+        original_weight_loader = layer.weight.weight_loader
+
+        def _fp8_pertensor_weight_loader(param, loaded_weight, *args, **kwargs):
+            param.data = param.data.t()
+            original_weight_loader(param, loaded_weight, *args, **kwargs)
+            param.data = param.data.t()
+
         layer.weight = _create_param_from_subclass_attributes(
             ModelWeightParameter(
                 data=weight.data,
                 output_dim=0,
                 input_dim=1,
-                weight_loader=layer.weight.weight_loader,
+                weight_loader=_fp8_pertensor_weight_loader,
             )
         )
+        # Per-tensor scale is merged into a single (1,) scalar by
+        # process_fp8_weight_tensor_strategy and is shared across all TP ranks.
+        # Use PerTensorScaleParameter (what vLLM creates in create_weights) so
+        # that load_row_parallel_weight delegates to BasevLLMParameter._assert_and_load
+        # (direct copy) instead of RowvLLMParameter's version which does
+        # self.data.shape[input_dim] on a 1-D tensor and raises IndexError.
+        # Use a reshape-aware loader to handle scalar vs (1,) shape differences.
+        def _per_tensor_scale_loader(param, loaded_weight):
+            param.data.copy_(loaded_weight.reshape(param.data.shape))
+
         layer.weight_scale = _create_param_from_subclass_attributes(
-            BlockQuantScaleParameter(
+            PerTensorScaleParameter(
                 data=weight_scale.data,
-                output_dim=0,
-                input_dim=1,
-                weight_loader=layer.weight_scale.weight_loader,
+                weight_loader=_per_tensor_scale_loader,
             )
         )
-        if input_scale is not None:
-            replace_parameter(layer, "input_scale", input_scale)
         return
 
     # vLLM v0.17 removed the `else: register_parameter("input_scale", None)` from
