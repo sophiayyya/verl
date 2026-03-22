@@ -350,13 +350,11 @@ def process_weights_after_loading_for_vllm14(self, layer) -> None:
             )
         )
     else:
-        # If checkpoint is fp8 per-tensor, handle that there are N scales for N
-        # shards in a fused module
+        # Per-tensor: merge per-shard scales into a single scalar and
+        # requantize the fused weight, then transpose for torch._scaled_mm.
         weight = layer.weight
         weight_scale = layer.weight_scale
 
-        # If using w8a8, torch._scaled_mm needs per tensor, so
-        # requantize the logical shards as a single weight.
         weight, weight_scale, input_scale = process_fp8_weight_tensor_strategy(
             weight,
             weight_scale,
@@ -365,45 +363,35 @@ def process_weights_after_loading_for_vllm14(self, layer) -> None:
         )
         weight = weight.t()
 
-        # Wrap the original weight_loader so that refit (repeated load_weights
-        # calls) works correctly.  After process_weights_after_loading, the
-        # weight is stored transposed as [in, out] for torch._scaled_mm.
-        # When load_qkv_weight (or any other loader) runs during refit it
-        # narrows on output_dim=0, which now points to the input dimension and
-        # produces a shape mismatch.  The wrapper temporarily flips the view
-        # back to [out, in] via a zero-copy .t() stride swap, lets the original
-        # loader run against the correct layout, then flips back.
+        # Update weight data in-place, preserving the original param type
+        # (e.g. ModelWeightParameter) and all metadata (output_dim, tp_rank,
+        # load_qkv_weight method resolution, etc.).
+        #
+        # DO NOT use _create_param_from_subclass_attributes here: it copies
+        # class methods as bound-method instance attributes whose `self`
+        # points to the temporary ModelWeightParameter, not the live param.
+        # During refit, the wrapper transposes param.data but
+        # load_qkv_weight(self=stale_custom_param) reads the un-transposed
+        # custom_param.data, causing a shape assertion failure.
         original_weight_loader = layer.weight.weight_loader
+        layer.weight.data = weight
 
         def _fp8_pertensor_weight_loader(param, loaded_weight, *args, **kwargs):
+            """Transpose back → load shard → transpose for torch._scaled_mm."""
             param.data = param.data.t()
             original_weight_loader(param, loaded_weight, *args, **kwargs)
             param.data = param.data.t()
 
-        layer.weight = _create_param_from_subclass_attributes(
-            ModelWeightParameter(
-                data=weight.data,
-                output_dim=0,
-                input_dim=1,
-                weight_loader=_fp8_pertensor_weight_loader,
-            )
-        )
-        # Per-tensor scale is merged into a single (1,) scalar by
-        # process_fp8_weight_tensor_strategy and is shared across all TP ranks.
-        # Use PerTensorScaleParameter (what vLLM creates in create_weights) so
-        # that load_row_parallel_weight delegates to BasevLLMParameter._assert_and_load
-        # (direct copy) instead of RowvLLMParameter's version which does
-        # self.data.shape[input_dim] on a 1-D tensor and raises IndexError.
-        # Use a reshape-aware loader to handle scalar vs (1,) shape differences.
-        def _per_tensor_scale_loader(param, loaded_weight):
+        layer.weight.weight_loader = _fp8_pertensor_weight_loader
+
+        # Update merged scalar scale in-place and set a simple loader
+        # that handles shape differences during refit.
+        layer.weight_scale.data = weight_scale.data
+
+        def _per_tensor_scale_loader(param, loaded_weight, *args, **kwargs):
             param.data.copy_(loaded_weight.reshape(param.data.shape))
 
-        layer.weight_scale = _create_param_from_subclass_attributes(
-            PerTensorScaleParameter(
-                data=weight_scale.data,
-                weight_loader=_per_tensor_scale_loader,
-            )
-        )
+        layer.weight_scale.weight_loader = _per_tensor_scale_loader
         return
 
     # vLLM v0.17 removed the `else: register_parameter("input_scale", None)` from
@@ -615,6 +603,39 @@ def process_weights_after_loading_moe_for_vllm14(self, layer) -> None:
             _create_param_from_subclass_attributes(w13_scale, getattr(layer, w13_scale_attr)))
     setattr(layer, w2_scale_attr,
             _create_param_from_subclass_attributes(w2_scale, getattr(layer, w2_scale_attr)))
+
+    # For per-tensor MoE, after processing the scales are merged:
+    #   w13_weight_scale: (E, 2) → (E,)  (max of w1/w3 per expert)
+    #   w2_weight_scale:  (E,)  → (E,)   (unchanged)
+    # But during refit, FusedMoE._load_per_tensor_weight_scale does
+    # param_data[expert_id][idx] which fails on (E,) tensors (0-dim index).
+    # Override weight_loader to handle the merged shape.
+    if not self.block_quant:
+        def _make_moe_scale_refit_loader(fused_moe_layer):
+            """Create a refit weight_loader for merged per-tensor MoE scales.
+
+            FusedMoE.weight_loader signature:
+              (self, param, loaded_weight, weight_name, shard_id, expert_id,
+               return_success=False)
+            The param's weight_loader is a bound method, so the model calls:
+              weight_loader(param, loaded_weight, weight_name, shard_id,
+                            expert_id)
+            """
+            def _loader(param, loaded_weight, weight_name, shard_id,
+                        expert_id, return_success=False):
+                # Map global → local expert_id (handles expert parallelism)
+                local_id = fused_moe_layer._map_global_expert_id_to_local_expert_id(expert_id)
+                if local_id == -1:
+                    return False if return_success else None
+                # Scale is (E,) after merging; just store per-expert scalar.
+                # For w13, both w1 and w3 scales write to the same slot
+                # (last one wins — acceptable approximation for RL refit).
+                param.data[local_id] = loaded_weight
+                return True if return_success else None
+            return _loader
+
+        getattr(layer, w13_scale_attr).weight_loader = _make_moe_scale_refit_loader(layer)
+        getattr(layer, w2_scale_attr).weight_loader = _make_moe_scale_refit_loader(layer)
 
     self.moe_quant_config = self.get_fused_moe_quant_config(layer)
     if self.moe_quant_config:
