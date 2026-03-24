@@ -268,22 +268,19 @@ class vLLMHttpServer:
                     all_mlp_gate_layers.append(f"model.layers.{layer}.mlp.gate")
 
                 fp8_quant_granularity = getattr(self.config, "fp8_quant_granularity", "per_block")
+                # Always use blockwise config for vLLM kernel performance (deep_gemm on Hopper).
+                # When per_tensor is requested, quant_weights does per-tensor quantization
+                # but broadcasts the scalar scale to blockwise shape — numerically identical
+                # but 10x faster because vLLM selects the optimized blockwise MoE kernel.
+                FP8_QUANT_KWARGS = {
+                    "activation_scheme": "dynamic",
+                    "fmt": "e4m3",
+                    "quant_method": "fp8",
+                    "weight_block_size": [128, 128],
+                    "ignored_layers": all_mlp_gate_layers,
+                }
                 if fp8_quant_granularity == "per_tensor":
-                    FP8_QUANT_KWARGS = {
-                        "activation_scheme": "dynamic",
-                        "fmt": "e4m3",
-                        "quant_method": "fp8",
-                        # no weight_block_size → per-tensor quantization
-                        "ignored_layers": all_mlp_gate_layers,
-                    }
-                else:
-                    FP8_QUANT_KWARGS = {
-                        "activation_scheme": "dynamic",
-                        "fmt": "e4m3",
-                        "quant_method": "fp8",
-                        "weight_block_size": [128, 128],
-                        "ignored_layers": all_mlp_gate_layers,
-                    }
+                    os.environ["VERL_FP8_QUANT_GRANULARITY"] = "per_tensor"
                 hf_overrides["quantization_config"] = dict(FP8_QUANT_KWARGS)
                 # Apply vllm fp8 patches
                 # Will remove the patch after vllm support on-the-fly quant for rollout natively.

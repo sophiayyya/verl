@@ -104,6 +104,11 @@ def is_fp8_weight(name, model):
 def quant_weights(weights, model, quant_config, dtype=torch.bfloat16):
     """Quantize weights to FP8 format using a memory-efficient generator.
 
+    Supports two quantization granularities:
+    - **per_tensor**: one scale per entire weight tensor (set via VERL_FP8_QUANT_GRANULARITY=per_tensor).
+      The scalar scale is broadcast to blockwise shape so vLLM uses the fast blockwise
+      MoE kernel (deep_gemm on Hopper). Numerically identical to native per-tensor.
+    - **blockwise** (default): one scale per (128×128) block.
 
     Args:
         weights: Generator or iterable of (name, tensor) pairs
@@ -114,9 +119,8 @@ def quant_weights(weights, model, quant_config, dtype=torch.bfloat16):
     Yields:
         Tuples of (name, tensor) for each weight and its scale
     """
-    # if quant_config.weight_block_size is None:
-    #     raise ValueError("Currently only support blockwise quantization, please set weight_block_size in quant_config")
-    is_per_tensor = quant_config.weight_block_size is None
+    import os
+    use_per_tensor_quant = os.environ.get("VERL_FP8_QUANT_GRANULARITY") == "per_tensor"
     # vLLM v0.11-v0.12 renamed weight_scale_inv → weight_scale in process_weights_after_loading,
     # so load_weights expects "_scale" suffix. v0.14+ keeps weight_scale_inv, so expects "_scale_inv".
     _use_scale_not_scale_inv = version.parse("0.11.0") <= version.parse(vllm.__version__) < version.parse("0.14.0")
@@ -126,14 +130,29 @@ def quant_weights(weights, model, quant_config, dtype=torch.bfloat16):
             yield (k, v)
             continue
 
-        if is_per_tensor:
+        if use_per_tensor_quant:
+            # Per-tensor quantization: one scale for the entire weight tensor.
+            # Broadcast scalar scale to blockwise shape so vLLM uses the fast
+            # blockwise kernel path (deep_gemm on Hopper) — numerically identical.
             if torch.distributed.get_rank() == 0:
-                logger.debug(f"Quantizing to FP8 per-tensor: {k}")
+                logger.debug(f"Quantizing to FP8 per-tensor (blockwise format): {k}")
             from vllm import _custom_ops as ops
             param_lp, param_scale = ops.scaled_fp8_quant(v, scale=None)
+
+            # Broadcast per-tensor descale to blockwise scale shape.
+            # Both scaled_fp8_quant and scaled_fp8_blockwise return descale
+            # factors (absmax / fp8_max), so no inversion needed.
+            block_size = quant_config.weight_block_size  # e.g. [128, 128]
+            scale_h = (param_lp.shape[0] + block_size[0] - 1) // block_size[0]
+            scale_w = (param_lp.shape[1] + block_size[1] - 1) // block_size[1]
+            param_scale_block = param_scale.view(1, 1).expand(scale_h, scale_w).contiguous()
+
             yield (k, param_lp)
-            # per-tensor always uses "weight_scale" regardless of vllm version
-            yield (k + "_scale", param_scale)
+            if _use_scale_not_scale_inv and "expert" not in k:
+                yield (k + "_scale", param_scale_block)
+            else:
+                yield (k + "_scale_inv", param_scale_block)
+            del param_scale_block
         else:
             if torch.distributed.get_rank() == 0:
                 logger.debug(f"Quantizing to FP8 blockwise: {k}")
@@ -652,7 +671,9 @@ def process_weights_after_loading_moe_for_vllm14(self, layer) -> None:
 
 
 def apply_vllm_fp8_patches():
-    logger.info("Applying vllm fp8 patches for blockwise quantization")
+    import os
+    granularity = os.environ.get("VERL_FP8_QUANT_GRANULARITY", "per_block")
+    logger.info(f"Applying vllm fp8 patches (quant granularity: {granularity}, kernel: blockwise)")
     vllm_ver = version.parse(vllm.__version__)
 
     # Linear patch: v0.14+ keeps weight_scale_inv, v0.11-v0.12 renames to weight_scale
