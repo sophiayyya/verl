@@ -28,9 +28,26 @@ try:
 except ImportError as e:
     raise ImportError("FP8 quantization not available") from e
 
+from verl.utils.fp8_utils import FP8QuantizerHelper
 from verl.utils.kernel.fp8_kernel import scaled_fp8_blockwise
 
 logger = logging.getLogger(__name__)
+
+
+class VLLMAsyncFP8QuantizerHelper(FP8QuantizerHelper):
+    """Client-side async FP8 quantizer with vLLM version-specific scale naming."""
+
+    def __init__(self, quant_config):
+        super().__init__(quant_config)
+        # vLLM v0.11-v0.13: linear layers use _scale; v0.10, v0.14+: use _scale_inv
+        self._use_scale_not_scale_inv = (
+            version.parse("0.11.0") <= version.parse(vllm.__version__) < version.parse("0.14.0")
+        )
+
+    def _get_scale_name(self, weight_name: str) -> str:
+        if self._use_scale_not_scale_inv and "expert" not in weight_name:
+            return weight_name + "_scale"
+        return weight_name + "_scale_inv"
 
 
 # Ref: https://github.com/NVIDIA-NeMo/RL/commit/bc24887c72a6e1b2699a228bc87c588546dfe6b7
@@ -150,12 +167,15 @@ def quant_weights(weights, model, quant_config, dtype=torch.bfloat16):
         del v, param_lp, param_scale
 
 
-def load_quanted_weights(weights, model_runner):
+def load_quanted_weights(weights, model_runner, pre_quantized=False):
     model = model_runner.model
-    quant_config = model_runner.vllm_config.quant_config
-    vllm_dtype = model_runner.vllm_config.model_config.dtype
 
-    weights_quantized = quant_weights(weights, model, quant_config, dtype=vllm_dtype)
+    if pre_quantized:
+        weights_quantized = weights
+    else:
+        quant_config = model_runner.vllm_config.quant_config
+        vllm_dtype = model_runner.vllm_config.model_config.dtype
+        weights_quantized = quant_weights(weights, model, quant_config, dtype=vllm_dtype)
 
     # Monkey patch the param class to their subclass, as certain models
     # will check the param type to call the proper weightloader

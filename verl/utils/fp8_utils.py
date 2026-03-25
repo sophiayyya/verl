@@ -83,6 +83,10 @@ class FP8QuantizerHelper:
         logger.debug(f"Skip quantization: {param_name}")
         return False
 
+    def _get_scale_name(self, weight_name: str) -> str:
+        """Return scale parameter name. Subclasses override for backend-specific naming."""
+        return weight_name + "_scale_inv"
+
     async def quant_weights_by_name(self, weights, dtype=torch.bfloat16):
         """FP8 quantization based on parameter name using a memory-efficient generator.
 
@@ -121,7 +125,7 @@ class FP8QuantizerHelper:
 
                 # Yield the quantized weight and scale
                 yield (k, param_lp)
-                yield (k + "_scale_inv", param_scale)
+                yield (self._get_scale_name(k), param_scale)
 
                 # Explicitly delete to help GC
                 del param_lp, param_scale

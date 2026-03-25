@@ -72,6 +72,15 @@ class ServerAdapter(BaseRollout):
         replica_rank: int = -1,
     ):
         super().__init__(config, model_config, device_mesh)
+        self._fp8_enabled = self.config.get("quantization", None) == "fp8"
+        if self._fp8_enabled:
+            FP8_BLOCK_QUANT_KWARGS = {
+                "activation_scheme": "dynamic",
+                "fmt": "e4m3",
+                "quant_method": "fp8",
+                "weight_block_size": [128, 128],
+            }
+            self.model_config.hf_config.quantization_config = dict(FP8_BLOCK_QUANT_KWARGS)
         self.server_handle: ray.actor.ActorHandle = None
 
         rank = int(os.environ["RANK"])
@@ -160,8 +169,15 @@ class ServerAdapter(BaseRollout):
         future = await self._execute_method(
             "update_weights_from_ipc",
             non_block=True,
-            kwargs={**kwargs, "use_shm": self.use_shm},
+            kwargs={**kwargs, "use_shm": self.use_shm, "pre_quantized_fp8": self._fp8_enabled},
         )
+
+        if self._fp8_enabled:
+            from verl.utils.vllm.vllm_fp8_utils import VLLMAsyncFP8QuantizerHelper
+
+            logger.info("Convert bf16 weights to fp8 format before sending")
+            fp8_quantizer = VLLMAsyncFP8QuantizerHelper(self.model_config.hf_config.quantization_config)
+            weights = fp8_quantizer.quant_weights_by_name(weights, dtype=torch.bfloat16)
 
         bucket_size_mb = self.config.checkpoint_engine.update_weights_bucket_megabytes
         sender = BucketedWeightSender(
