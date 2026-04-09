@@ -26,6 +26,7 @@ __all__ = [
     "DiffusionSamplingConfig",
     "MultiTurnConfig",
     "CustomAsyncServerConfig",
+    "KVRoutingConfig",
     "AgentLoopConfig",
     "TraceConfig",
     "ServerConfig",
@@ -95,6 +96,32 @@ class CustomAsyncServerConfig(BaseConfig):
 
 
 @dataclass
+class KVRoutingConfig(BaseConfig):
+    """Configuration for KV-aware routing (inspired by NVIDIA Dynamo).
+
+    When enabled, the load balancer uses a radix tree to track prefix cache state
+    across inference workers and routes requests to maximize KV cache reuse.
+    """
+
+    # Enable KV-aware routing. When False, uses the default sticky-session + least-loaded LB.
+    enable: bool = False
+    # Backend: "dynamo" uses Rust RadixTree from dynamo._core (requires ai-dynamo-runtime);
+    #          "python" uses pure-Python fallback (no extra deps).
+    backend: str = "dynamo"
+    # Tokens per KV cache block. Must match the inference engine block size.
+    block_size: int = 16
+    # Weight for prefill cost vs inflight cost in the routing cost function.
+    # Higher values prioritize cache reuse (better TTFT).
+    # Lower values prioritize even load distribution (better ITL).
+    overlap_score_weight: float = 1.0
+    # Softmax temperature for worker selection.
+    # 0.0 = deterministic (always pick best), >0 = stochastic sampling.
+    temperature: float = 0.0
+    # TTL in seconds for radix tree entries. Stale entries are periodically expired.
+    ttl_secs: float = 120.0
+
+
+@dataclass
 class AgentLoopConfig(BaseConfig):
     num_workers: int = 8
     default_agent_loop: str = "single_turn_agent"
@@ -103,6 +130,8 @@ class AgentLoopConfig(BaseConfig):
     # Fully qualified class name for custom AgentLoopManager (e.g., "mypackage.module.MyManager").
     # Security: This class will be dynamically imported via importlib. Only use trusted class paths.
     agent_loop_manager_class: Optional[str] = None
+    # KV-aware routing configuration
+    kv_routing: KVRoutingConfig = field(default_factory=KVRoutingConfig)
 
 
 @dataclass

@@ -72,8 +72,9 @@ class GlobalRequestLoadBalancer:
         self._inflight_requests: dict[str, int] = {sid: 0 for sid in server_actor_ids}
         self._request_id_to_server: LRUCache = LRUCache(maxsize=max_cache_size)
 
-    def acquire_server(self, request_id: str) -> str:
+    def acquire_server(self, request_id: str, prompt_ids: list[int] | None = None) -> str:
         """Acquire a server for the given request, reusing the same server for multi-turn conversations."""
+        # prompt_ids accepted for interface compatibility with KVAwareLoadBalancer but not used here.
         # request-level sticky (multi-turn: same conversation -> same server)
         if request_id in self._request_id_to_server:
             server_id = self._request_id_to_server[request_id]
@@ -127,8 +128,12 @@ class AsyncLLMServerManager:
         self._load_balancer = load_balancer_handle
         self._server_id_to_handle: dict[str, ray.actor.ActorHandle] = dict(servers)
 
-    async def _acquire_server(self, request_id: str) -> tuple[str, ray.actor.ActorHandle]:
-        server_id = await self._load_balancer.acquire_server.remote(request_id=request_id)
+    async def _acquire_server(
+        self, request_id: str, prompt_ids: list[int] | None = None
+    ) -> tuple[str, ray.actor.ActorHandle]:
+        server_id = await self._load_balancer.acquire_server.remote(
+            request_id=request_id, prompt_ids=prompt_ids
+        )
         handle = self._server_id_to_handle.get(server_id)
         if handle is None:
             raise RuntimeError(f"Unknown server_id returned by load balancer: {server_id}")
@@ -160,7 +165,7 @@ class AsyncLLMServerManager:
         Returns:
             TokenOutput | DiffusionOutput: token or diffusion output
         """
-        server_id, server = await self._acquire_server(request_id)
+        server_id, server = await self._acquire_server(request_id, prompt_ids=prompt_ids)
         try:
             output: TokenOutput | DiffusionOutput = await server.generate.remote(
                 request_id=uuid4().hex,  # use new request_id for each turn
@@ -1136,10 +1141,55 @@ class AgentLoopManager:
             )
 
     async def _init_global_load_balancer(self) -> None:
-        self.global_load_balancer = GlobalRequestLoadBalancer.remote(
-            server_actor_ids=self.server_addresses,
-            max_cache_size=DEFAULT_ROUTING_CACHE_SIZE,
-        )
+        kv_routing_cfg = OmegaConf.select(self.rollout_config, "agent.kv_routing", default=None)
+        if kv_routing_cfg is not None and kv_routing_cfg.get("enable", False):
+            backend = kv_routing_cfg.get("backend", "dynamo")
+            kv_lb_kwargs = dict(
+                server_actor_ids=self.server_addresses,
+                block_size=kv_routing_cfg.get("block_size", 16),
+                overlap_score_weight=kv_routing_cfg.get("overlap_score_weight", 1.0),
+                temperature=kv_routing_cfg.get("temperature", 0.0),
+                max_cache_size=DEFAULT_ROUTING_CACHE_SIZE,
+                ttl_secs=kv_routing_cfg.get("ttl_secs", 120.0),
+            )
+
+            if backend == "dynamo":
+                from verl.experimental.agent_loop.kv_router.dynamo_router import (
+                    DynamoKVRouter,
+                    _check_dynamo_available,
+                )
+
+                if _check_dynamo_available():
+                    self.global_load_balancer = DynamoKVRouter.remote(**kv_lb_kwargs)
+                    logger.info(
+                        "KV-aware routing enabled (backend=dynamo/rust, block_size=%d, weight=%.1f)",
+                        kv_lb_kwargs["block_size"],
+                        kv_lb_kwargs["overlap_score_weight"],
+                    )
+                else:
+                    logger.warning(
+                        "dynamo._core not available, falling back to Python KV router. "
+                        "Install ai-dynamo-runtime for Rust-accelerated routing."
+                    )
+                    from verl.experimental.agent_loop.kv_router import KVAwareLoadBalancer
+
+                    self.global_load_balancer = KVAwareLoadBalancer.remote(**kv_lb_kwargs)
+            else:
+                from verl.experimental.agent_loop.kv_router import KVAwareLoadBalancer
+
+                self.global_load_balancer = KVAwareLoadBalancer.remote(**kv_lb_kwargs)
+                logger.info(
+                    "KV-aware routing enabled (backend=python, block_size=%d, weight=%.1f)",
+                    kv_lb_kwargs["block_size"],
+                    kv_lb_kwargs["overlap_score_weight"],
+                )
+            self._kv_routing_enabled = True
+        else:
+            self.global_load_balancer = GlobalRequestLoadBalancer.remote(
+                server_actor_ids=self.server_addresses,
+                max_cache_size=DEFAULT_ROUTING_CACHE_SIZE,
+            )
+            self._kv_routing_enabled = False
 
     @auto_await
     async def generate_sequences(self, prompts: DataProto) -> DataProto:
