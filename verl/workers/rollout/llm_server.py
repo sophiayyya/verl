@@ -301,28 +301,46 @@ class LLMServerManager:
         )
         num_replicas = world_size // rollout_world_size
 
-        self.rollout_replicas = [
-            self.rollout_replica_class(
-                replica_rank=start_rank + replica_rank,
-                config=self.rollout_config,
-                model_config=self.model_config,
-                gpus_per_node=self.rollout_config.n_gpus_per_node,
-            )
-            for replica_rank in range(num_replicas)
-        ]
+        use_dynamo_worker_pool = (
+            self.worker_group
+            and self.rollout_config.name == "dynamo"
+            and hasattr(self.rollout_replica_class, "init_hybrid_worker_pool")
+        )
 
-        if self.worker_group and self.rollout_config.name != "trtllm":
-            await asyncio.gather(*[server.init_hybrid(self.worker_group) for server in self.rollout_replicas])
-        # TODO: unify trtllm to init_hybrid
-        elif self.worker_group and self.rollout_config.name == "trtllm":
-            await asyncio.gather(
-                *[
-                    server.init_hybrid_colocated(self.worker_group, self.rollout_resource_pool)
-                    for server in self.rollout_replicas
-                ]
-            )
+        if use_dynamo_worker_pool:
+            self.rollout_replicas = [
+                self.rollout_replica_class(
+                    replica_rank=start_rank,
+                    config=self.rollout_config,
+                    model_config=self.model_config,
+                    gpus_per_node=self.rollout_config.n_gpus_per_node,
+                )
+            ]
+            await self.rollout_replicas[0].init_hybrid_worker_pool(self.worker_group)
         else:
-            await asyncio.gather(*[server.init_standalone() for server in self.rollout_replicas])
+            self.rollout_replicas = [
+                self.rollout_replica_class(
+                    replica_rank=start_rank + replica_rank,
+                    config=self.rollout_config,
+                    model_config=self.model_config,
+                    gpus_per_node=self.rollout_config.n_gpus_per_node,
+                )
+                for replica_rank in range(num_replicas)
+            ]
+
+        if not use_dynamo_worker_pool:
+            if self.worker_group and self.rollout_config.name != "trtllm":
+                await asyncio.gather(*[server.init_hybrid(self.worker_group) for server in self.rollout_replicas])
+            # TODO: unify trtllm to init_hybrid
+            elif self.worker_group and self.rollout_config.name == "trtllm":
+                await asyncio.gather(
+                    *[
+                        server.init_hybrid_colocated(self.worker_group, self.rollout_resource_pool)
+                        for server in self.rollout_replicas
+                    ]
+                )
+            else:
+                await asyncio.gather(*[server.init_standalone() for server in self.rollout_replicas])
 
         self.server_handles = [server._server_handle for server in self.rollout_replicas]
         self.server_addresses = [server._server_address for server in self.rollout_replicas]

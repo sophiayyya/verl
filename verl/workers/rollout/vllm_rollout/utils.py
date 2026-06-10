@@ -285,10 +285,16 @@ class vLLMColocateWorkerExtension:
             logger.info("ModelOpt QAT: process_weights_after_loading completed")
         elif use_standard_weight_load:
             # Some post-load transforms are non-idempotent; run once after all buckets.
+            from vllm.config import set_current_vllm_config
             from vllm.model_executor.model_loader.utils import process_weights_after_loading
 
+            # vLLM 0.20: process_weights_after_loading instantiates FlashInfer Cutlass
+            # MoE CustomOps that call get_current_vllm_config(). Outside an active
+            # set_current_vllm_config() context this refit raises "Current vLLM config
+            # is not set". Wrap the post-load transform in the engine's own config.
             for model, model_config in self._iter_all_models_with_config():
-                process_weights_after_loading(model, model_config, self.device)
+                with set_current_vllm_config(self.model_runner.vllm_config):
+                    process_weights_after_loading(model, model_config, self.device)
 
     def _update_weights(self, weights: list[tuple[str, torch.Tensor]], peft_config: dict, base_sync_done: bool):
         if peft_config and base_sync_done:
