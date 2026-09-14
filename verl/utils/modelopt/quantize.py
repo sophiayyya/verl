@@ -100,5 +100,11 @@ def apply_qat(
 ) -> nn.Module:
     """Apply Quantization-Aware Training to a Megatron model."""
     config = build_quantize_config(qat_mode, ignore_patterns)
-    mtq.quantize(model, config)
+    if qat_mode == "mxfp4_experts":
+        from verl.utils.modelopt.checkpoint import preserve_mxfp4_checkpoint_methods
+
+        with preserve_mxfp4_checkpoint_methods(model):
+            mtq.quantize(model, config)
+    else:
+        mtq.quantize(model, config)
     return model

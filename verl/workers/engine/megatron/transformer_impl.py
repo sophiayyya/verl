@@ -595,8 +595,7 @@ class MegatronEngine(BaseEngine):
                 if hasattr(_mo_te, "_assert_te_fp8_enabled"):
                     _mo_te._assert_te_fp8_enabled = lambda: None
                     logger.warning(
-                        "QAT: bypassing modelopt _assert_te_fp8_enabled "
-                        "(weight-only fake-quant + TE FP8 GEMM)"
+                        "QAT: bypassing modelopt _assert_te_fp8_enabled (weight-only fake-quant + TE FP8 GEMM)"
                     )
             from verl.utils.modelopt import apply_qat_to_modules
 
@@ -828,6 +827,12 @@ class MegatronEngine(BaseEngine):
         """
         if self._is_offload_param:
             load_megatron_model_to_gpu(self.module)
+        if self._is_offload_optimizer:
+            # HDO rebuilds its CPU/GPU parameter mappings in load_state_dict.
+            # Restore the optimizer's main parameter shards first: loading only
+            # the model leaves the offloaded copies on CPU, where HDO treats
+            # them as native CPU parameters and loses the GPU copy mappings.
+            load_megatron_optimizer(self.optimizer)
         self.checkpoint_mananager.load_checkpoint(
             local_path=local_path, hdfs_path=hdfs_path, del_local_after_load=del_local_after_load
         )
