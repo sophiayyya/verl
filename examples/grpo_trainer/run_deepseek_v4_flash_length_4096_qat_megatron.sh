@@ -1,12 +1,47 @@
 #!/usr/bin/env bash
 # DeepSeek-V4-Flash-0731: MXFP4 QAT, response 4096, 40 steps, validation every 10.
-# Standalone MXFP4 QAT arm; the length-only baseline is a separate script.
+# Standalone MXFP4 expert QAT recipe with TE FP8 training.
 # Plan A: prompt/response 1024/4096, overlong buffer 512 with penalty 1.0,
 # clip high 0.28 / dual clip 10.0, no thinking; expert MXFP4 QAT plus TE FP8 training.
 # Set MODEL_PATH, TRAIN_FILE and TEST_FILE in the launch environment.
 # Optional: set OUTPUT_DIR or override each checkpoint/rollout/validation directory.
 # For two segments, use TOTAL_TRAINING_STEPS=20, then 40 with the same checkpoint directory.
 # Requires DeepSeek-V4 support in Megatron-Bridge, Megatron-Core and vLLM.
+
+# Megatron prerequisite: HDO with native FP32 parameters
+#
+# This DeepSeek-V4-Flash example enables `optimizer_cpu_offload=True` and retains some model
+# parameters in FP32. For this combination, Megatron's `DistributedOptimizer` must detach FP32
+# model parameters before creating their optimizer shards. Otherwise, reconstructing
+# `HybridDeviceOptimizer` can fail during optimizer initialization with:
+#
+# ```text
+# ValueError: can't optimize a non-leaf Tensor
+# ```
+#
+# The required fix is in `megatron/core/optimizer/distrib_optimizer.py`, inside
+# `DistributedOptimizer._build_model_and_main_param_groups`, in the FP32-parameter branch:
+#
+# ```diff
+# - shard_model_param = model_param.view(-1)[param_range.start : param_range.end]
+# + shard_model_param = model_param.detach().view(-1)[param_range.start : param_range.end]
+# ```
+#
+# Use a Megatron version containing this fix, or backport it to the selected dependency checkout.
+# The upstream fix is [NVIDIA/Megatron-LM#6982](https://github.com/NVIDIA/Megatron-LM/pull/6982),
+# commit
+# [`d5ff7ea72cffe1eb1daedaa2c7b2858694ab0d3c`](https://github.com/NVIDIA/Megatron-LM/commit/d5ff7ea72cffe1eb1daedaa2c7b2858694ab0d3c).
+#
+# **Validation provenance:** the completed 40-step MXFP4 QAT experiment used Megatron
+# `1ff25ca7e339fe521165da7f4373d9f52e7af436` with an equivalent local runtime patch,
+# `_patch_nonleaf_fp32_shards`. Both the initial 20-step segment and the resumed segment to step
+# 40 logged that the patch was applied. Validation ran at steps 10/20/30/40, with checkpoints
+# saved at steps 20/40 and optimizer state restored between segments.
+#
+# The runtime patch helper is not included in the published verl changes. Reproducing the
+# experiment with Megatron `1ff25ca7e` therefore requires the dependency fix above in addition to
+# the verl changes. This optimizer-initialization prerequisite is separate from the MXFP4
+# checkpoint serialization and HDO checkpoint-resume fixes in verl.
 
 set -euo pipefail
 
